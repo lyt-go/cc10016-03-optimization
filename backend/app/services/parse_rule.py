@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.services.seed_dependency_snapshot import snapshot_service
 from app.store import store
 
 MODULE = "parse_rule"
@@ -90,14 +91,16 @@ class ParseRuleService:
         ok, msg = _validate_selector(entry.get("选择器类型"), entry.get("选择器表达式") or "")
         entry["_selector_check"] = {"ok": ok, "msg": msg}
         rows.append(entry)
-        # 绑定种子
+        # 绑定种子（幂等，避免重复登记造成关系重复计数）
         seed_id = values.get("关联种子ID")
         if seed_id:
             try:
                 sid = int(seed_id)
-                store.add_relation("seed_to_parse_rule", "seed_config", sid, MODULE, entry["id"])
+                store.add_relation_if_absent("seed_to_parse_rule", "seed_config", sid, MODULE, entry["id"])
             except (ValueError, TypeError):
                 pass
+        # 规则侧口径变更：既有依赖快照全部标记待重算
+        snapshot_service.mark_all_stale("解析规则登记导致关联关系变更")
         return entry, []
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
@@ -115,6 +118,8 @@ class ParseRuleService:
         entry["status"] = target
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
+        # 规则口径（状态）变更：关联数口径可能变化，标记依赖快照待重算
+        snapshot_service.mark_all_stale(f"解析规则 {entry_id} 状态变更为{target}")
         return entry, f"解析规则已{action}"
 
     def generate_field_extracts(self, entry_id: int) -> list[dict[str, Any]]:
@@ -143,3 +148,81 @@ class ParseRuleService:
             store.add_relation("parse_to_field", MODULE, entry_id, "field_extract", new_entry["id"])
             templates.append(new_entry)
         return templates
+
+    # ------------------------------------------------------------------
+    # 种子依赖快照：解析规则按跨模块链路读取快照，读取后同步回写
+    # ------------------------------------------------------------------
+    def read_seed_dependency_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
+        """读取种子管理一侧形成的依赖快照，并同步回写读取痕迹。"""
+        snapshot = snapshot_service.get_snapshot(snapshot_id)
+        if snapshot is None:
+            return None
+        read_record = snapshot_service.mark_read(snapshot_id, reader=MODULE)
+        # 只取本快照涉及的规则编号集合，规则侧不重扫全量规则
+        return {
+            "snapshot_id": snapshot_id,
+            "criteria_version": snapshot["criteria_version"],
+            "boundary": snapshot["boundary"],
+            "rule_id_set": list(snapshot["rule_id_set"]),
+            "rule_index": snapshot["rule_index"],
+            "entries": snapshot["entries"],
+            "history_supplements": snapshot.get("history_supplements", []),
+            "read_record": read_record,
+            "stale": snapshot.get("stale", False),
+        }
+
+    def recompute_fields_from_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        """只重算快照规则编号集合涉及的字段抽取模板，并把结果回写快照。
+
+        沿解析规则取数链路（parse_rule -> field_extract）定位模板，
+        快照之外的规则与模板完全不参与重算。
+        """
+        snapshot = snapshot_service.get_snapshot(snapshot_id)
+        if snapshot is None:
+            return {"ok": False, "error": f"依赖快照 {snapshot_id} 不存在"}
+        rule_ids = [int(rid) for rid in snapshot["rule_id_set"]]
+        from app.services.field_extract import FieldExtractService
+        fe_svc = FieldExtractService()
+        recomputed: list[dict[str, Any]] = []
+        touched_template_ids: list[int] = []
+        for rule_id in rule_ids:
+            rule = store.find(MODULE, rule_id)
+            if rule is None:
+                continue
+            field_rels = store.get_relations(
+                "parse_to_field", source_module=MODULE, source_id=rule_id)
+            template_ids = [int(rel["target_id"]) for rel in field_rels]
+            # 没有既有模板时，按规则补生成（仍限定在快照规则集合内）
+            if not template_ids:
+                generated = self.generate_field_extracts(rule_id)
+                template_ids = [int(item["id"]) for item in generated]
+            for template_id in template_ids:
+                template = store.find("field_extract", template_id)
+                if template is None:
+                    continue
+                sample_html = (
+                    "<div class='item'><h1 class='title'>快照重算示例</h1>"
+                    "<span class='price'>188.80</span></div>"
+                )
+                extract_result = fe_svc.extract_fields(template_id, sample_html)
+                recomputed.append({
+                    "rule_id": rule_id,
+                    "rule_code": rule.get("规则编号"),
+                    "template_id": template_id,
+                    "template_code": template.get("模板编号"),
+                    "field": template.get("字段名"),
+                    "extract": extract_result,
+                })
+                touched_template_ids.append(template_id)
+            # 回写每条规则的重算记录
+            snapshot_service.record_field_recompute(
+                snapshot_id, rule_id=rule_id, field_template_ids=template_ids, reader=MODULE)
+        return {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "rule_count": len(rule_ids),
+            "rule_ids": rule_ids,
+            "field_template_count": len(touched_template_ids),
+            "field_template_ids": touched_template_ids,
+            "recomputed": recomputed,
+        }

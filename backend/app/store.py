@@ -30,6 +30,20 @@ class Store:
             "data_validate_reports": {},     # data_validate 校验报告
             "result_store_partitions": {},   # result_store 分区元数据
             "rate_limit_states": {},         # rate_limit 令牌桶状态
+            # 种子依赖快照（种子管理一侧形成，解析规则跨模块读取后回写）。
+            # 这里预置一份 SNAPSHOT_VERSION 之前的存量历史版本（v1），
+            # 首次读取时由 SnapshotService 迁移到当前口径，验证历史版本兼容。
+            "seed_dependency_snapshots": {
+                "legacy-v1-demo": {
+                    "snapshot_version": 1,
+                    "snapshot_id": "legacy-v1-demo",
+                    "created_at": "2026-11-01T00:00:00Z",
+                    "scope": {"status": "已生效"},
+                    "seeds": [
+                        {"seed_id": 1, "seed_code": "SEED-E001", "rule_ids": [1]},
+                    ],
+                },
+            },
         }
         # 模块间关系索引（外键映射）——基于 seed 数据自动构建
         self._relations: dict[str, list[dict[str, Any]]] = {
@@ -196,6 +210,24 @@ class Store:
             "target_id": target_id,
             "meta": meta or {},
         })
+
+    def has_relation(self, relation_type: str, source_module: str, source_id: int,
+                     target_module: str, target_id: int) -> bool:
+        """判断一条跨模块关系是否已经存在，供去重写入使用。"""
+        for rel in self._relations.get(relation_type, []):
+            if (rel["source_module"] == source_module and rel["source_id"] == source_id
+                    and rel["target_module"] == target_module and rel["target_id"] == target_id):
+                return True
+        return False
+
+    def add_relation_if_absent(self, relation_type: str, source_module: str, source_id: int,
+                               target_module: str, target_id: int,
+                               meta: dict[str, Any] | None = None) -> bool:
+        """幂等写入关系：已存在时跳过并返回 False，新增时返回 True。"""
+        if self.has_relation(relation_type, source_module, source_id, target_module, target_id):
+            return False
+        self.add_relation(relation_type, source_module, source_id, target_module, target_id, meta)
+        return True
 
     def get_relations(self, relation_type: str, source_module: str | None = None,
                       source_id: int | None = None, target_module: str | None = None,

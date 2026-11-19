@@ -75,5 +75,29 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 种子依赖快照
+
+种子管理与解析规则之间通过“种子依赖快照”解耦，避免逐页扫描全部解析规则、
+以及种子状态与关联规则数两边口径不一致的问题，实现集中在
+`backend/app/services/seed_dependency_snapshot.py`。
+
+- **同一筛选边界**：种子状态筛选与规则关联数在同一次扫描内由同一索引确定，
+  列表接口（`GET /api/seed_config`）返回行附带 `_snapshot_id` 与 `_page_boundary`。
+- **一份可定位快照**：筛选条件（字段过滤/检索关键字/状态/排序/冲突口径）参与
+  口径哈希，同口径请求复用同一份快照；分页只决定分页边界，不会混入上一页计数。
+  `GET /api/seed_config/dependency_snapshots/{id}/locate?seed_code=...` 可按种子
+  编号定位关联规则数与分页边界。
+- **版本冲突两种口径**：`status_first` 先筛状态再回查仍被引用的过期历史种子
+  （`history_supplements` 补项）；`reference_first` 先聚合引用保留历史依赖全貌，
+  无规则种子在第二轮排除并写明原因（`excluded_no_rule`）。过期但仍被引用的种子
+  带明确标记。
+- **跨模块消费**：解析规则经
+  `GET /api/parse_rule/seed_dependency_snapshots/{id}` 读取快照并同步回写读取痕迹，
+  `POST .../recompute_fields` 只重算快照规则编号集合涉及的字段抽取模板。
+- **口径变更与兼容**：种子/规则状态或关联关系变更会把相关快照标记为 `stale`，
+  可按原条件重算；存量 v1 历史快照在首次读取时自动迁移到当前版本（v2）。
+- 采集种子优先处理顺序当前标注为“待判定”，顺序口径确认后只需调整
+  `PRIORITY_RANK` 常量。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

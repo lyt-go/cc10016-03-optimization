@@ -617,3 +617,68 @@ test('概览汇总', async ({ page }) => {
   await expect(page.locator('.stat-value').nth(1)).toBeVisible()
   // 验证概览页加载正常即可，不硬编码精确计数（取决于各模块 E2E 登记成功数）
 })
+
+test('种子依赖快照：构建、口径切换、定位、过期引用标记、重算', async ({ page }) => {
+  test.setTimeout(120_000)
+  const browserErrors: string[] = []
+  page.on('pageerror', e => browserErrors.push(e.message))
+  page.on('response', r => { if (r.url().includes('/api/') && r.status() >= 400) browserErrors.push(`${r.status()} ${r.url()}`) })
+
+  await page.goto('/seed_config')
+  await page.waitForTimeout(2000)
+  await expect(page.getByTestId('snapshot-panel')).toBeVisible()
+
+  // 构建一份默认口径（status_first）快照
+  await page.getByTestId('build-snapshot').click()
+  await expect(page.getByTestId('current-snapshot')).toBeVisible()
+  const snapshotId = (await page.getByTestId('snapshot-id-input').inputValue()).trim()
+  expect(snapshotId.startsWith('SDS-')).toBeTruthy()
+  // 快照条目必须带关联规则数与分页定位
+  await expect(page.getByTestId('snapshot-rule-count').first()).toBeVisible()
+
+  // 按种子编号定位关联规则数与分页边界
+  await page.getByTestId('locate-seed-code').fill('SEED-E001')
+  await page.getByTestId('locate-seed').click()
+  await expect(page.getByTestId('located-entry')).toBeVisible()
+  await expect(page.getByTestId('located-entry')).toContainText('关联规则数 2')
+
+  // 切换 reference_first 口径后重算，仍是同一份页面内可定位快照
+  await page.getByTestId('snapshot-strategy').selectOption('reference_first')
+  await page.getByTestId('recalc-snapshot').click()
+  await expect(page.getByTestId('current-snapshot')).toBeVisible()
+
+  // 历史快照清单（含 v1 迁移）
+  await page.getByTestId('load-snapshots').click()
+  await expect(page.getByTestId('snapshot-list-summary')).toBeVisible()
+
+  expect(browserErrors).toEqual([])
+})
+
+test('解析规则消费种子依赖快照：读取回写与限定范围重算', async ({ page }) => {
+  test.setTimeout(120_000)
+  const browserErrors: string[] = []
+  page.on('pageerror', e => browserErrors.push(e.message))
+  page.on('response', r => { if (r.url().includes('/api/') && r.status() >= 400) browserErrors.push(`${r.status()} ${r.url()}`) })
+
+  // 先在种子管理页生成一份快照
+  await page.goto('/seed_config')
+  await page.waitForTimeout(2000)
+  await page.getByTestId('build-snapshot').click()
+  await expect(page.getByTestId('current-snapshot')).toBeVisible()
+  const snapshotId = (await page.getByTestId('snapshot-id-input').inputValue()).trim()
+
+  await page.goto('/parse_rule')
+  await page.waitForTimeout(2000)
+  await expect(page.getByTestId('snapshot-panel')).toBeVisible()
+  await page.getByTestId('parse-snapshot-id').fill(snapshotId)
+  await page.getByTestId('read-snapshot').click()
+  await expect(page.getByTestId('consumed-snapshot')).toBeVisible()
+  await expect(page.getByTestId('consumed-rule-ids')).not.toHaveText('')
+
+  // 只重算快照规则集合涉及的字段抽取模板
+  await page.getByTestId('recompute-snapshot-fields').click()
+  await expect(page.getByTestId('recompute-result')).toBeVisible()
+  await expect(page.getByTestId('recompute-result')).toContainText('字段抽取模板')
+
+  expect(browserErrors).toEqual([])
+})

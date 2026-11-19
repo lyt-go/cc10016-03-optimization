@@ -96,3 +96,21 @@ def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
 def generate_field_extracts(entry_id: int) -> dict:
     """基于解析规则生成字段抽取模板。"""
     return {"items": service.generate_field_extracts(entry_id)}
+
+
+@router.get("/seed_dependency_snapshots/{snapshot_id}")
+def read_seed_dependency_snapshot(snapshot_id: str) -> dict:
+    """跨模块链路：解析规则读取种子依赖快照，读取后同步回写。"""
+    result = service.read_seed_dependency_snapshot(snapshot_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"依赖快照 {snapshot_id} 不存在")
+    return result
+
+
+@router.post("/seed_dependency_snapshots/{snapshot_id}/recompute_fields")
+def recompute_fields_from_snapshot(snapshot_id: str) -> dict:
+    """只重算本快照规则编号集合涉及的字段抽取模板，结果回写快照。"""
+    result = service.recompute_fields_from_snapshot(snapshot_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error", "快照不存在"))
+    return result

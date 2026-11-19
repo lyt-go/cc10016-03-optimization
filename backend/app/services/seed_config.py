@@ -4,6 +4,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.services.seed_dependency_snapshot import (
+    STRATEGY_STATUS_FIRST,
+    select_boundary_rows,
+    snapshot_service,
+)
 from app.store import store
 
 MODULE = "seed_config"
@@ -46,21 +51,34 @@ class SeedConfigService:
         status: str | None = None,
         page: int = 1,
         size: int = 20,
+        sort_by: str | None = None,
+        sort_order: str = "asc",
+        strategy: str = STRATEGY_STATUS_FIRST,
     ) -> tuple[list[dict[str, Any]], int]:
-        rows = store.rows(MODULE)
-        for field, expected in (filters or {}).items():
-            rows = [row for row in rows if expected.casefold() in str(row.get(field, "")).casefold()]
-        if keyword:
-            rows = [row for row in rows if keyword.casefold() in str(row.get("种子编号", "")).casefold()]
-        if status:
-            rows = [row for row in rows if row.get("status") == status]
-        total = len(rows)
+        # 列表与种子依赖快照共用同一筛选边界：状态与规则关联数一次扫描同时确定，
+        # 不再逐页扫描全部解析规则，也不会让上一页的规则计数混入当前页。
+        snapshot = snapshot_service.build_snapshot(
+            filters=filters, keyword=keyword, status=status,
+            sort_by=sort_by, sort_order=sort_order, strategy=strategy,
+            page=page, size=size)
+        # 快照条目按同一索引给出规则关联数，直接按 id 取用，避免重复扫描关系表。
+        count_by_id = {
+            entry["seed_id"]: entry["rule_count"]
+            for entry in snapshot["entries"] + snapshot.get("history_supplements", [])
+        }
         start = (page - 1) * size
+        rows = select_boundary_rows(
+            filters=filters, keyword=keyword, status=status,
+            sort_by=sort_by, sort_order=sort_order)
+        total = len(rows)
         enriched = []
         for row in rows[start:start + size]:
             d = dict(row)
-            d["_parse_rule_count"] = len(store.get_relations("seed_to_parse_rule", source_module=MODULE, source_id=d["id"]))
+            d["_parse_rule_count"] = count_by_id.get(int(d["id"]), 0)
             d["_cursor_count"] = len(store.get_relations("seed_to_cursor", source_module=MODULE, source_id=d["id"]))
+            d["_snapshot_id"] = snapshot["snapshot_id"]
+            d["_snapshot_version"] = snapshot["snapshot_version"]
+            d["_page_boundary"] = snapshot["boundary"]
             enriched.append(d)
         return enriched, total
 
@@ -114,6 +132,8 @@ class SeedConfigService:
         entry["status"] = target
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
+        # 状态口径变更：涉及该种子的依赖快照标记为待重算，避免过期种子与关联数错位。
+        snapshot_service.mark_stale_for_seed(entry_id)
         return entry, f"采集种子已{action}"
 
     def get_linked_parse_rules(self, entry_id: int) -> list[dict[str, Any]]:

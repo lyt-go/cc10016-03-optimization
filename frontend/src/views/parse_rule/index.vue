@@ -56,6 +56,68 @@
       </tbody>
     </table>
 
+    <section class="snapshot-panel" data-testid="snapshot-panel">
+      <header class="snapshot-head">
+        <h3>种子依赖快照消费（跨模块链路）</h3>
+        <p class="page-desc">
+          读取种子管理一侧形成的依赖快照，读取后同步回写；只重算本快照规则编号集合涉及的字段抽取模板。
+        </p>
+      </header>
+      <form class="filter-bar" @submit.prevent="readSnapshot">
+        <label class="filter-item">
+          <span>快照编号</span>
+          <input v-model="snapshotId" data-testid="parse-snapshot-id" placeholder="如 SDS-xxxx" />
+        </label>
+        <button class="btn primary" data-testid="read-snapshot" type="submit">读取快照并回写</button>
+        <button class="btn" data-testid="recompute-snapshot-fields" type="button" @click="recomputeFields">
+          只重算快照涉及模板
+        </button>
+      </form>
+      <div v-if="snapshotMessage" class="error-text" data-testid="snapshot-message">{{ snapshotMessage }}</div>
+
+      <div v-if="consumedSnapshot" data-testid="consumed-snapshot">
+        <p>
+          快照 <strong>{{ consumedSnapshot.snapshot_id }}</strong>
+          （口径 {{ consumedSnapshot.criteria_version }}）｜
+          分页边界：第 {{ consumedSnapshot.boundary.page }} / {{ consumedSnapshot.boundary.pages }} 页，
+          区间 [{{ consumedSnapshot.boundary.page_start }}, {{ consumedSnapshot.boundary.page_end }})
+          <span v-if="consumedSnapshot.stale" class="tag tag-warn">快照待重算</span>
+        </p>
+        <p>本快照规则编号集合（{{ consumedSnapshot.rule_id_set.length }} 条）：
+          <strong data-testid="consumed-rule-ids">{{ consumedSnapshot.rule_id_set.join('、') }}</strong>
+        </p>
+        <p>读取回写：{{ consumedSnapshot.read_record?.reader }} @ {{ consumedSnapshot.read_record?.at }}</p>
+        <table class="data-table">
+          <thead>
+            <tr><th>种子编号</th><th>状态</th><th>关联规则数</th><th>规则编号</th><th>标记</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="entry in consumedSnapshot.entries" :key="entry.seed_id"
+                :data-testid="`consumed-row-${entry.seed_id}`">
+              <td>{{ entry.seed_code }}</td>
+              <td>{{ entry.status }}</td>
+              <td>{{ entry.rule_count }}</td>
+              <td>{{ entry.rule_codes.join('、') || '—' }}</td>
+              <td>
+                <span v-if="entry.is_expired && entry.rule_count > 0" class="tag tag-warn">过期但仍被引用</span>
+                <span v-else-if="entry.retain_reason" class="tag">{{ entry.retain_reason }}</span>
+                <span v-else>—</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div v-if="recomputeResult" data-testid="recompute-result">
+        <h4>重算结果</h4>
+        <p>
+          涉及规则 {{ recomputeResult.rule_count }} 条，
+          字段抽取模板 {{ recomputeResult.field_template_count }} 个：
+          {{ recomputeResult.field_template_ids.join('、') }}
+        </p>
+      </div>
+    </section>
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记解析规则</h3>
@@ -100,6 +162,11 @@ const filterFields = columns.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+
+const snapshotId = ref('')
+const consumedSnapshot = ref<Record<string, any> | null>(null)
+const recomputeResult = ref<Record<string, any> | null>(null)
+const snapshotMessage = ref('')
 const stats = computed(() => [
   { label: metricNames[0], value: total.value },
   { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
@@ -184,5 +251,69 @@ async function reload() {
   }
 }
 
+async function readSnapshot() {
+  snapshotMessage.value = ''
+  if (!snapshotId.value) {
+    snapshotMessage.value = '请填写种子依赖快照编号'
+    return
+  }
+  try {
+    const response = await request(`${ENDPOINT}/seed_dependency_snapshots/${snapshotId.value}`)
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({ detail: '快照读取失败' }))
+      throw new Error(data.detail || '快照读取失败')
+    }
+    consumedSnapshot.value = await response.json()
+    recomputeResult.value = null
+  } catch (error) {
+    consumedSnapshot.value = null
+    snapshotMessage.value = error instanceof Error ? error.message : '快照读取失败'
+  }
+}
+
+async function recomputeFields() {
+  snapshotMessage.value = ''
+  if (!snapshotId.value) {
+    snapshotMessage.value = '请填写种子依赖快照编号'
+    return
+  }
+  try {
+    const response = await request(
+      `${ENDPOINT}/seed_dependency_snapshots/${snapshotId.value}/recompute_fields`,
+      { method: 'POST' },
+    )
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({ detail: '模板重算失败' }))
+      throw new Error(data.detail || '模板重算失败')
+    }
+    recomputeResult.value = await response.json()
+  } catch (error) {
+    snapshotMessage.value = error instanceof Error ? error.message : '模板重算失败'
+  }
+}
+
 onMounted(reload)
 </script>
+
+<style scoped>
+.snapshot-panel {
+  margin-top: 24px;
+  padding: 16px;
+  border: 1px solid var(--border-color, #d9d9d9);
+  border-radius: 8px;
+}
+.snapshot-head {
+  margin-bottom: 12px;
+}
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #f0f0f0;
+  font-size: 12px;
+}
+.tag-warn {
+  background: #fff3e0;
+  color: #d46b08;
+}
+</style>
